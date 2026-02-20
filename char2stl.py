@@ -19,12 +19,13 @@ import sys
 import time
 from pathlib import Path
 
+import torch
 import numpy as np
 import trimesh
 from PIL import Image
 
 from trellis2.pipelines import Trellis2ImageTo3DPipeline
-import o_voxel
+import cumesh
 
 
 def load_pipeline(model_id="microsoft/TRELLIS.2-4B"):
@@ -52,26 +53,29 @@ def generate_mesh(pipeline, image_path, resolution=1024, seed=42):
 
 
 def mesh_to_trimesh(mesh, decimate=1000000):
-    """Convert TRELLIS.2 MeshWithVoxel to a trimesh object via o_voxel."""
+    """Convert TRELLIS.2 MeshWithVoxel to a trimesh object (geometry only, no texture)."""
     t0 = time.time()
-    result = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices,
-        faces=mesh.faces,
-        attr_volume=mesh.attrs,
-        coords=mesh.coords,
-        attr_layout=mesh.layout,
-        voxel_size=mesh.voxel_size,
-        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=decimate,
-        texture_size=1,  # no texture needed for STL
-        remesh=True,
-        remesh_band=1,
-        remesh_project=0,
-        verbose=False
+    vertices = mesh.vertices.cuda()
+    faces = mesh.faces.cuda()
+
+    # Use cumesh for cleaning, remeshing, and decimation
+    cm = cumesh.CuMesh()
+    cm.init(vertices, faces)
+    cm.fill_holes(max_hole_perimeter=3e-2)
+    cm.remove_duplicate_faces()
+    cm.repair_non_manifold_edges()
+    cm.remove_small_connected_components(1e-5)
+    cm.fill_holes(max_hole_perimeter=3e-2)
+    cm.simplify(decimate)
+    cm.remove_duplicate_faces()
+    cm.repair_non_manifold_edges()
+    cm.unify_face_orientations()
+
+    out_verts, out_faces = cm.read()
+    result = trimesh.Trimesh(
+        vertices=out_verts.cpu().numpy(),
+        faces=out_faces.cpu().numpy(),
     )
-    # to_glb returns a trimesh Scene or Trimesh; force to single mesh
-    if isinstance(result, trimesh.Scene):
-        result = trimesh.util.concatenate(result.dump())
     print(f"  Post-process: {time.time() - t0:.1f}s, {len(result.faces)} faces")
     return result
 
@@ -94,8 +98,11 @@ def repair_mesh(mesh):
     ms.meshing_remove_unreferenced_vertices()
     ms.meshing_repair_non_manifold_edges()
     ms.meshing_repair_non_manifold_vertices()
+    ms.meshing_remove_duplicate_faces()
+    ms.meshing_repair_non_manifold_edges()
+    ms.meshing_repair_non_manifold_vertices()
+    ms.meshing_re_orient_faces_coherently()
     ms.meshing_close_holes(maxholesize=100)
-    ms.meshing_re_orient_faces_coherentely()
 
     repaired = ms.current_mesh()
     result = trimesh.Trimesh(
